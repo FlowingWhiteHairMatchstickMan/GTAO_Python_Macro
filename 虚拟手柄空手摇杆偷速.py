@@ -3,30 +3,23 @@ import json
 import os
 import ctypes
 from PyQt6.QtWidgets import *
-from PyQt6.QtCore import pyqtSignal, Qt
+from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap, QImage
 import vgamepad as vg
 from pynput import keyboard
-from PIL import Image  # 需要安装 Pillow
+from PIL import Image
 
 
-# ==================== 图标加载（使用 Pillow 保证成功率） ====================
+# ==================== 图标加载 ====================
 def load_icon_with_pillow(filepath):
-    """
-    使用 Pillow 读取 ICO/PNG，生成多尺寸图标，确保 Windows 任何位置都能显示。
-    """
     if not os.path.exists(filepath):
         print(f"❌ 图标文件不存在: {filepath}")
         return QIcon()
-
     try:
         img = Image.open(filepath)
-        # 转换为 RGBA（支持透明）
         if img.mode != 'RGBA':
             img = img.convert('RGBA')
-
         icon = QIcon()
-        # 生成多个常用尺寸（Windows 需要小尺寸）
         sizes = [16, 24, 32, 48, 64, 128, 256]
         for size in sizes:
             resized = img.resize((size, size), Image.Resampling.LANCZOS)
@@ -43,40 +36,37 @@ def load_icon_with_pillow(filepath):
 
 
 def get_icon_path():
-    """获取图标路径，兼容开发环境和打包"""
     icon_filename = "running-512.ico"
     if getattr(sys, 'frozen', False):
         exe_dir = os.path.dirname(sys.executable)
-        # 先找 exe 同目录
         path = os.path.join(exe_dir, icon_filename)
         if os.path.exists(path):
             return path
-        # 再找临时解压目录
         if hasattr(sys, '_MEIPASS'):
             path = os.path.join(sys._MEIPASS, icon_filename)
             if os.path.exists(path):
                 return path
         return path
     else:
-        # 开发环境：当前脚本所在目录
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), icon_filename)
 
 
 # ==================== 主窗口 ====================
 class RunnerApp(QMainWindow):
-    hotkey_signal = pyqtSignal()
+    press_signal = pyqtSignal()
+    release_signal = pyqtSignal()
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("虚拟手柄空手偷速跑")
-        self.setFixedSize(350, 200)
-
-        # ---------- 窗口不再单独设置图标，由全局图标统一 ----------
-        # 注意：Qt 的窗口会继承全局图标，所以无需重复设置
+        self.setFixedSize(380, 220)
 
         self.is_enabled = False
         self.is_triggering = False
-        self.hotkey = "F1"
+        self.hotkey = "Shift"  # 默认热键改为 Shift
+        self.trigger_mode = "toggle"
+        self._is_key_down = False
+
         self.ds4 = None
         self.listener = None
         self._is_listener_running = False
@@ -85,7 +75,9 @@ class RunnerApp(QMainWindow):
         self.load_config()
         self.init_ui()
         self.register_hotkey()
-        self.hotkey_signal.connect(self.on_hotkey_triggered)
+
+        self.press_signal.connect(self.on_key_press_ui)
+        self.release_signal.connect(self.on_key_release_ui)
 
     def init_controller(self):
         try:
@@ -108,13 +100,27 @@ class RunnerApp(QMainWindow):
         h_layout = QHBoxLayout()
         h_layout.addWidget(QLabel("切换热键:"))
         self.hotkey_combo = QComboBox()
-        self.hotkey_combo.setToolTip("选择 F1 ~ F10 作为切换热键")
-        for i in range(1, 11):
+        self.hotkey_combo.setToolTip("选择 Shift、` (反引号键) 或 F1~F12 作为切换热键")
+
+        # 修改点：将 ~ 改为 `
+        self.hotkey_combo.addItem("Shift")
+        self.hotkey_combo.addItem("`")
+        for i in range(1, 13):
             self.hotkey_combo.addItem(f"F{i}")
+
         self.hotkey_combo.setCurrentText(self.hotkey)
         self.hotkey_combo.currentTextChanged.connect(self.on_hotkey_changed)
         h_layout.addWidget(self.hotkey_combo)
         layout.addLayout(h_layout)
+
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("触发方式:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("切换模式 (按一下开/关)")
+        self.mode_combo.addItem("按住模式 (按住触发)")
+        self.mode_combo.currentTextChanged.connect(self.on_mode_changed)
+        mode_layout.addWidget(self.mode_combo)
+        layout.addLayout(mode_layout)
 
         self.status_label = QLabel("状态: 摇杆回中 (0%)")
         layout.addWidget(self.status_label)
@@ -123,25 +129,43 @@ class RunnerApp(QMainWindow):
         layout.addWidget(self.info_label)
 
     # ---------- 热键管理 ----------
-    def get_pynput_hotkey(self, display_name: str) -> str:
-        if display_name.upper().startswith("F") and display_name[1:].isdigit():
-            return f"<{display_name.lower()}>"
-        return display_name.lower()
+    def get_pynput_key_obj(self, display_name: str):
+        if display_name == "Shift":
+            return keyboard.Key.shift
+        elif display_name == "`":
+            # 修改点：匹配不按Shift的纯反引号按键
+            return keyboard.KeyCode.from_char('`')
+        elif display_name.upper().startswith("F") and display_name[1:].isdigit():
+            return getattr(keyboard.Key, display_name.lower())
+        return None
 
     def register_hotkey(self):
         self.stop_listener()
-        hotkey_str = self.get_pynput_hotkey(self.hotkey)
+        self.target_key = self.get_pynput_key_obj(self.hotkey)
+        self._is_key_down = False
+
         try:
-            self.listener = keyboard.GlobalHotKeys({
-                hotkey_str: self._hotkey_callback
-            })
+            self.listener = keyboard.Listener(
+                on_press=self._on_key_press,
+                on_release=self._on_key_release
+            )
             self.listener.start()
             self._is_listener_running = True
-            print(f"✅ 热键注册成功: {self.hotkey} -> {hotkey_str}")
+            print(f"✅ 热键注册成功: {self.hotkey}")
             self.status_label.setText(f"热键: {self.hotkey}")
         except Exception as e:
             QMessageBox.critical(self, "热键注册失败", f"无法注册热键 {self.hotkey}:\n{e}")
             self._is_listener_running = False
+
+    def _on_key_press(self, key):
+        if key == self.target_key and not self._is_key_down:
+            self._is_key_down = True
+            self.press_signal.emit()
+
+    def _on_key_release(self, key):
+        if key == self.target_key and self._is_key_down:
+            self._is_key_down = False
+            self.release_signal.emit()
 
     def stop_listener(self):
         if self.listener and self._is_listener_running:
@@ -153,21 +177,36 @@ class RunnerApp(QMainWindow):
                 pass
         self.listener = None
 
-    def _hotkey_callback(self):
-        self.hotkey_signal.emit()
-
-    def on_hotkey_triggered(self):
-        self.toggle_trigger()
-
     def on_hotkey_changed(self, text):
         self.hotkey = text.strip()
         self.register_hotkey()
         self.save_config()
 
-    # ---------- 核心功能 ----------
-    def toggle_trigger(self):
+    def on_mode_changed(self, text):
+        if "按住模式" in text:
+            self.trigger_mode = "hold"
+        else:
+            self.trigger_mode = "toggle"
+        self._is_key_down = False
+        if self.is_triggering:
+            self.stop_trigger()
+        self.save_config()
+
+    def on_key_press_ui(self):
         if not self.is_enabled:
             return
+        if self.trigger_mode == "toggle":
+            self.toggle_trigger()
+        elif self.trigger_mode == "hold":
+            self.start_trigger()
+
+    def on_key_release_ui(self):
+        if not self.is_enabled:
+            return
+        if self.trigger_mode == "hold":
+            self.stop_trigger()
+
+    def toggle_trigger(self):
         if self.is_triggering:
             self.stop_trigger()
         else:
@@ -205,7 +244,11 @@ class RunnerApp(QMainWindow):
 
     # ---------- 配置持久化 ----------
     def save_config(self):
-        data = {"hotkey": self.hotkey, "enabled": self.is_enabled}
+        data = {
+            "hotkey": self.hotkey,
+            "enabled": self.is_enabled,
+            "trigger_mode": self.trigger_mode
+        }
         try:
             with open("config.json", "w") as f:
                 json.dump(data, f, indent=2)
@@ -217,8 +260,19 @@ class RunnerApp(QMainWindow):
             try:
                 with open("config.json", "r") as f:
                     data = json.load(f)
-                    self.hotkey = data.get("hotkey", "F1")
+                    loaded_hotkey = data.get("hotkey", "Shift")
+
+                    # 兼容旧配置：如果之前存的是 ~，自动替换为 `
+                    if loaded_hotkey == "~":
+                        loaded_hotkey = "`"
+
+                    if loaded_hotkey not in ["Shift", "`"] + [f"F{i}" for i in range(1, 13)]:
+                        loaded_hotkey = "Shift"
+                    self.hotkey = loaded_hotkey
                     self.is_enabled = data.get("enabled", False)
+                    self.trigger_mode = data.get("trigger_mode", "toggle")
+                    if self.trigger_mode not in ["toggle", "hold"]:
+                        self.trigger_mode = "toggle"
             except:
                 pass
 
@@ -233,38 +287,25 @@ class RunnerApp(QMainWindow):
 
 # ==================== 程序入口 ====================
 if __name__ == "__main__":
-    # 可选：强制管理员权限（如需启用，取消注释）
-    # if not ctypes.windll.shell32.IsUserAnAdmin():
-    #     ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
-    #     sys.exit(0)
-
     app = QApplication(sys.argv)
 
-    # ---------- 设置 Windows 任务栏标识（确保任务栏图标关联） ----------
     if sys.platform == "win32":
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
                 "GordoFakeController.AutoRun.88"
             )
-            print("✅ AppUserModelID 已设置")
         except Exception as e:
             print(f"⚠️ 设置 AppUserModelID 失败: {e}")
 
-    # ---------- 加载并设置全局图标 ----------
     icon_path = get_icon_path()
     if os.path.exists(icon_path):
         icon = load_icon_with_pillow(icon_path)
         if not icon.isNull():
             app.setWindowIcon(icon)
-            print("✅ 全局图标已设置")
-        else:
-            print("⚠️ 图标加载失败，窗口将没有图标")
-    else:
-        print(f"⚠️ 图标文件未找到: {icon_path}")
 
     window = RunnerApp()
-    # 同步配置
     window.hotkey_combo.setCurrentText(window.hotkey)
+    window.mode_combo.setCurrentIndex(0 if window.trigger_mode == "toggle" else 1)
     window.enable_check.setChecked(window.is_enabled)
     window.show()
     sys.exit(app.exec())
